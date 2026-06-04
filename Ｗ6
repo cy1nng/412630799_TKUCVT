@@ -1,0 +1,72 @@
+# W06｜Docker Image 與 Dockerfile
+
+## 映像組成
+- Layers 是什麼：Docker 映像檔的唯讀層，Dockerfile 中的每一條指令都會產生一個新層。
+              它們採用Copy-on-Write機制與層級堆疊設計，下層被上層覆蓋時不會被修改，
+              這使得多個Image可以共享相同的底層，大大節省了儲存空間。
+- Config 是什麼：這是一份 JSON 格式的設定檔，用來定義容器執行時的預設行為和環境。
+              它包含了容器啟動時要執行的指令、環境變數、預設工作目錄、暴露的連接埠以及儲存卷等元數據。
+- Manifest 是什麼：映像檔的清單或導覽圖。它負責將Layers和Config串聯在一起。當你執行docker pull時，
+                Docker 會先下載Manifes，確認這個Image包含哪些Layers（雜湊值/Giggle 碼）以及對應的Config，
+                甚至能支援Multi-platform，讓同一個標籤在 Windows/Linux/ARM 規格下自動抓取對應版本。
+
+## python:3.12-slim inspect 摘錄
+- Config.Cmd：["python3"]
+- Config.Env：通常包含 PATH=/usr/local/bin:...、LANG=C.UTF-8、GPG_KEY=...、PYTHON_VERSION=3.12.x 等環境變數。
+- Config.WorkingDir：""
+- RootFS.Layers 數量：3 
+## Layer 快取實驗
+| 情境 | build 時間 |
+|---|---|
+| v1 首次 build |較慢，需要下載套件、執行pip install|
+| v1 改 app.py 後 rebuild |較慢，因為COPY . . 在 pip install之前，程式碼一變，後續快取全部失效|
+| v2 首次 build |較慢，重新建立優化後的層結構|
+| v2 改 app.py 後 rebuild |極快，幾秒內完成，完全命中快取|
+
+觀察（用自己的話寫）：為什麼 v2 的 rebuild 這麼快？
+  因為v2優化了Dockerfile的指令順序。它將不容易變動的COPY requirements.txt . 與RUN pip install移到了前面，
+而將頻繁變動的COPY app.py .或 COPY . .放到最後面。當修改app.py時，Docker發現requirements.txt那一層之前的內容完全沒變，
+因此直接重複使用了前面耗時最長的pip install層，只需要重新打包最後一層app.py即可。
+
+## CMD vs ENTRYPOINT 實驗
+| 寫法 | `docker run <img>` 輸出 | `docker run <img> extra1 extra2` 輸出 |
+|---|---|---|
+| CMD shell form | hello | hello，後方參數會被完全忽略，因為 shell 形式會被包裝成 /bin/sh -c |
+| CMD exec form | hello | extra1 extra2，後方參數會完全覆蓋掉 CMD 裡定義的預設指令 |
+| ENTRYPOINT + CMD | hello | extra1 extra2，後方參數會覆蓋 CMD，並作為參數追加在 ENTRYPOINT 後面 |
+
+結論（用自己的話寫）：我了解到ENTRYPOINT定義了容器啟動時不可或缺的執行本體，而CMD則是提供預設參數。
+                採用Exec form兩者結合時，靈活性最高，能讓容器像一個標準的Linux CLI工具一樣，
+                在外部直接帶入參數進行動態擴充。
+
+## Multi-stage 大小對照
+| Image | SIZE |
+|---|---|
+| python:3.12（builder base） | 1GB左右，包含完整編譯工具、gcc、headers |
+| python:3.12-slim（runtime base） | 120MB-150MB左右，僅含最小運行環境 |
+| myapp:v2（單階段） | 較大，把編譯依賴、快取暫存檔全都包進去了 |
+| myapp:multi（多階段） | 極小，體積幾乎等於runtime base+你的純程式碼與必要packages |
+
+解釋（用自己的話寫）：builder stage 的 layer 去哪了？
+  Multi-stage在最終產出Image時，只會保留最後一個FROM（即runtime階段）所定義的層，
+Builder階段的任務只是負責在獨立的臨時空間內把套件編譯、下載好。最後我們利用COPY --from=builder只把編譯好的成品抽離並複製到runtime階段，
+因此builder階段的所有編譯工具、工具鏈層通通都會被拋棄，不會佔用最終的生產線映像檔空間。
+
+## .dockerignore 故障注入
+| 項目 | 故障前 | 故障中 | 回復後 |
+|---|---|---|---|
+| du -sh . | 專案實際大小 (小) | 本地端總大小 (含 venv/大檔案，大) | 本地端總大小 (不變) |
+| build context 傳輸大小 | 極小 (僅數 KB/MB) | 暴增 (高達數百 MB 或 GB) | 回復極小值 |
+| build 時間 | 極快 | 變得很慢，卡在 Sending build context to Docker daemon | 回復極快 |
+
+## 排錯紀錄
+- 症狀：pip install時報錯，提示找不到某個C語言延伸模組，或者在docker run時發生sh: script.sh: not found。
+- 診斷：發現是因為使用了過於精簡的Base Image，缺乏了編譯該Python套件所需的gcc、g++或musl-dev等系統依賴。
+- 修正：在Dockerfile中，於pip install之前加上RUN apt-get update && apt-get install -y build-essential（若用 slim）或改用 Multi-stage 建構。
+- 驗證：重新執行docker build，映像檔成功順利編譯完成，且產出的容器能正常調用該套件。
+
+## 設計決策
+（說明本週至少 1 個技術選擇與取捨，例如：為什麼 runtime 選 `python:3.12-slim` 而不是 `alpine`？）
+  雖然alpine的基礎體積比slim更小，但在Python的生態圈中，alpine 使用的是musl libc，而絕大多數Python的第三方科學計算與重量級套件在PyPI上提供的預編譯二進位檔都是基於glibc發展的。
+如果選用alpine，當pip install找不到對應的Wheel時，就會強迫在容器內從原始碼現場編譯，這不僅會導致 Build 時間暴增，
+還必須在映像檔內塞入大量的gcc等編譯工具，最後產出的Image體積反而可能比slim還大。因此，選擇python:3.12-slim是一個在相容性與輕量化之間取得最佳平衡的技術取捨。
