@@ -1,0 +1,75 @@
+# W07｜Docker Compose 與資料持久化
+================================== [ Docker Host 宿主機 ] ==================================
+|                                                                                          |
+|  [ 外部瀏覽器 / 使用者 ]                                                                  |
+|          │                                                                               |
+|          ▼ (存取 http://localhost:8080)                                                  |
+|   ┌──────────────┐                                                                       |
+|   │ 宿主機 Port  │                                                                       |
+|   │    8080      │                                                                       |
+|   └──────┬───────┘                                                                       |
+|          │                                                                               |
+|          │ [ Port 映射轉發 ]                                                             |
+|          ▼                                                                               |
+|    ┌──────────────┐                                                                      |
+|    │  app 容器    │ ◄───┐                                                                |
+|    │  (Port 80)   │     │                                                                |
+|    └──────────────┘     │                                                                |
+|                         │ [ default_network ]                                            |
+|                         │ Docker Compose 預設橋接網路 (Bridge Network)                   |
+|                         │ 容器間可透過 Service Name (如 "db") 直接解析 IP                |
+|                         │                                                                |
+|    ┌──────────────┐     │                                                                |
+|    │   db 容器    │ ◄───┘                                                                |
+|    │ (3306/5432)  │                                                                      |
+|    └──────┬───────┘                                                                      |
+|           │                                                                              |
+|           │ [ Volume 掛載 ]                                                              |
+|           ▼                                                                              |
+|   ┏━━━━━━━━━━━━━━┓                                                                       |
+|   ┃ db-data      ┃ (具名磁碟卷 Named Volume)                                             |
+|   ┃ (持久化儲存) ┃ 實際路徑在宿主機的 /var/lib/docker/volumes/                                 |
+|   ┗━━━━━━━━━━━━━━┛                                                                       |
+|                                                                                          |
+============================================================================================
+## 拓樸圖
+（mermaid 或 ASCII，標出 app、db、default network、db-data volume）
+
+## 從 docker run 到 compose.yaml
+（自己的話：你最有感的一個改善是什麼？）
+  最深刻的改善是基礎設施即程式碼的宣告式管理。以前用docker run時，必須在終端機手動輸入一長串包含--network、-v、-p、-e的指令，
+不僅容易打錯，還要小心翼翼地手動控制容器啟動的先後順序。換成 compose.yaml 後，所有配置都變成清晰的文本檔案，
+一個docker compose up -d就能自動建立網路、掛載硬碟並按順序把所有服務拉起來，專案的可移植性與維護效率完全不可同日而語。
+
+## 三種掛載對照
+| 掛載類型 | 路徑（host） | 容器砍重起資料還在嗎 | 重啟容器資料狀態 | 適合情境 |
+|---|---|---|---|---|
+| named volume | 由 Docker 統一管理，Linux通常在/var/lib/docker/volumes/ | 在 | 資料完美保留，完全不受容器生命週期影響 | 生產環境的資料庫、需要被多個容器共享的持久化資料 |
+| bind mount | 由使用者指定，如 ./data 或 /home/user/app | 在 | 資料保留，且宿主機的檔案變更會即時同步到容器內 | 開發環境，例如將程式碼目錄掛載進容器，實現熱重載 Hot-Reload |
+| tmpfs | 無，存在宿主機的記憶體 RAM 中 | 消失 | 資料完全被清空，回復到映像檔的初始狀態 | 存放敏感暫存資訊或追求極致讀寫速度的快取。 |
+
+## healthcheck 前後對照
+| 寫法 | curl /healthz t=1s | t=3s | t=5s | t=10s |
+|---|---|---|---|---|
+| 只 depends_on | 500 / Error，DB 容器開了但還在初始化 | 500 / Error | 200 OK(DB 終於就緒) | 200 OK |
+| service_healthy | 容器等待中，App 根本還沒啟動 | 容器等待中 | 200 OK(App 在 DB 真正 Ready 後才啟動) | 200 OK |
+
+觀察（自己的話）：
+  單純的depends_on只保證DB容器的進程被拉起來，但不保證裡面的資料庫服務已經準備好接受連線。而加上 condition: service_healthy 後，
+Compose會嚴格依據DB的healthcheck指令，直到檢查回傳成功，才允許 App 容器啟動。這有效避免了分散式系統啟動時，因依賴服務尚未就緒而導致的應用程式崩潰。
+
+## 排錯紀錄
+- 症狀：App容器啟動後立刻崩潰，噴出Connection refused錯誤，但DB容器確實是啟動的。
+- 診斷：檢查compose.yaml發現App的環境變數中，資料庫的連線字串寫成了localhost（或 127.0.0.1）。在Docker的世界裡，
+      每個容器都是獨立的網路隔離空間，localhost指向的是App容器自己，而不是DB容器。
+- 修正：將App的資料庫連線Hostname從localhost修改為DB的Service名稱，利用Docker內建的DNS機制自動解析。
+- 驗證：執行docker compose down && docker compose up -d，App成功透過服務名稱連上資料庫，狀態顯示為Running。
+
+## 設計決策
+（為什麼 db 用 named volume 而不是 bind mount？為什麼不能在生產用 tmpfs 存資料庫？）
+1.效能優勢：Named volume在macOS/Windows環境下，其檔案系統效能顯著優於Bind mount，
+          因為它不需要處理宿主機與虛擬機之間繁重的底層檔案權限與圖層同步。
+  安全性與管理性：Named volume由Docker引擎全權託管，隔離性好，不會因為宿主機使用者不小心誤刪目錄、或是因為Linux UID/GID權限衝突導致資料庫無法寫入。
+2.tmpfs的資料是直接儲存在宿主機的記憶體中。生產環境的資料庫最核心的指標是Durability（持久性）。
+一旦遇到伺服器突發性斷電、OS崩潰或是容器因為OOM被系統強制殺掉重啟，儲存在tmpfs裡的所有商業資料、使用者帳號將會徹底灰飛煙滅且無法挽回，
+這在生產環境是絕對不允許發生的災難。
