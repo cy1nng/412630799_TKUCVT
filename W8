@@ -1,0 +1,48 @@
+# W08｜容器生產實踐
+
+## Healthcheck 故障測試
+- 停 db 後幾秒被標 unhealthy：（填）15
+- 對應的 log 訊息："Output": "curl: (7) Failed to connect to localhost port 8080: Connection refused\n"
+
+## Log 失控估算
+- noisy 容器 30s log 大小：1.5 MB
+- 預估 24h 大小：4.32 GB
+- 套 rotation 後穩定上限：30 MB - 40 MB
+
+## 資源限制實驗
+| 實驗 | 命令 | 觀察結果 | 對應 cgroup 檔 | 值 |
+|---|---|---|---|---|
+| OOM | stress-ng --vm 1 --vm-bytes 200m | exit 137, OOMKilled=true | memory.max | 134217728 |
+| CPU throttle | stress-ng --cpu 4 | docker stats CPU% ≈ 50% | cpu.max | 50000 100000 |
+
+## 權限四階對照
+| 階梯 | id | CapEff | NoNewPrivs | curl /healthz |
+|---|---|---|---|---|
+| 0 | uid=0(root) | 00000000a80425fb | false | 200 OK |
+| 1 | uid=1000(node) | 0000000000000000 | false | 200 OK |
+| 2 | uid=1000(node) | 0000000000000000 | true | 200 OK |
+| 3 | uid=1000(node) | 0000000000000000 | true | 500 Error / Crash |
+| 4 | uid=1000(node) | 0000000000000000 | true | 200 OK |
+
+## 排錯紀錄
+- 症狀 / 診斷 / 修正 / 驗證
+症狀：開啟 read_only: true 之後，Python Web 容器或 Node.js 容器在啟動時直接崩潰（CrashLoopBackOff），
+噴出 OSError: [Errno 30] Read-only file system: '/app/logs/app.log' 或無法在 /tmp 寫入 pid 檔案。
+
+診斷： 因為 read_only: true 會將容器內整個根目錄鎖死為唯讀，阻止任何寫入行為。然而，許多網頁框架或執行環境在啟動時，
+仍必須寫入日誌、暫存快取（cache）或 Session 檔案。
+
+修正： 在 compose.yaml 中利用 tmpfs 參數，針對需要寫入權限的特定目錄進行掛載。
+read_only: true
+tmpfs:
+  - /tmp
+  - /app/logs
+
+## 設計決策
+（你選的 mem_limit / cpus 數值理由是什麼？read_only 之後你補了哪些 tmpfs，為什麼？）
+1.經由本地端基準測試，該 Web 應用在正常尖峰負載下的記憶體佔用約為 60MB–80MB，CPU 使用率約在 15% 左右。為了預留突發流量的緩衝並防止惡意 DDOS 耗盡宿主機資源，
+將 mem_limit 設為 128MB，將 cpus 設為 0.5。這既能保證應用正常運作，又能確保即使該容器被攻破或陷入死循環，宿主機與其他容器依然有足夠的算力與記憶體存活。
+
+2.我補了 /tmp 與 /run。因為現代操作系統與執行環境運作時，需要 /tmp 來存放臨時的上傳檔案、編譯暫存，或是需要 /run 來存放進程鎖定檔（.pid）。
+使用 tmpfs 掛載這些目錄，可以將寫入限制在宿主機的記憶體中。這樣既滿足了應用程式需要寫入暫存檔的剛性需求，又維持了底層映像檔程式碼不被篡改的安全性，
+當容器重啟時，這些暫存資料也會自動清空，不留痕跡。
